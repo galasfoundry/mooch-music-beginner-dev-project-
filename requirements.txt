@@ -1,0 +1,19 @@
+# Core dependencies
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+python-jose
+passlib
+
+# Optional but recommended
+python-multipart
+python-dotenv
+
+# Testing
+pytest
+httpx
+
+# Future expansion
+openai  # for LLM integration
+redis   # for caching
