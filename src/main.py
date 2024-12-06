@@ -37,6 +37,19 @@ class AppState:
 # Global app state (in a real app, this would be a database)
 app_state = AppState()
 
+@app.get("/")
+def read_root():
+    return {
+        "message": "Welcome to the Musical Collaboration App",
+        "available_endpoints": [
+            "/users/create",
+            "/rounds/start",
+            "/compositions/upload",
+            "/compositions/vote",
+            "/rounds/current"
+        ]
+    }
+    
 @app.post("/users/create")
 def create_user(username: str):
     # Check if user already exists
