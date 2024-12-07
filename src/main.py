@@ -1,41 +1,12 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta
+import sqlite3
 
 app = FastAPI(title="Musical Collaboration App")
 
-# Simplified models
-class User:
-    def __init__(self, username: str):
-        self.username = username
-        self.id = hash(username)  # Simple unique identifier
-
-class Composition:
-    def __init__(self, user: User, content: str, round_number: int):
-        self.id = hash(content)
-        self.user = user
-        self.content = content
-        self.round_number = round_number
-        self.timestamp = datetime.now()
-        self.votes = 0
-
-class Round:
-    def __init__(self, number: int):
-        self.number = number
-        self.start_time = datetime.now()
-        self.end_time = self.start_time + timedelta(hours=24)
-        self.compositions: List[Composition] = []
-        self.seed_composition: Optional[Composition] = None
-
-class AppState:
-    def __init__(self):
-        self.users: List[User] = []
-        self.rounds: List[Round] = []
-        self.current_round: Optional[Round] = None
-
-# Global app state (in a real app, this would be a database)
-app_state = AppState()
+# Add this to your existing main.py, typically near the top of the file, after the imports
 
 @app.get("/")
 def read_root():
@@ -50,94 +21,194 @@ def read_root():
         ]
     }
     
+# Database Connection Dependency
+def get_db():
+    conn = sqlite3.connect('music_collab.db')
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+# Pydantic Models for Request/Response Validation
+class UserCreate(BaseModel):
+    username: str
+
+class CompositionCreate(BaseModel):
+    username: str
+    content: str
+
+class CompositionResponse(BaseModel):
+    id: int
+    username: str
+    content: str
+    votes: int
+
+# Database Initialization Function
+def init_db(conn):
+    cursor = conn.cursor()
+    
+    # Create users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL
+        )
+    ''')
+
+    # Create compositions table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS compositions (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            content TEXT,
+            round_number INTEGER,
+            timestamp DATETIME,
+            votes INTEGER DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    ''')
+
+    # Create rounds table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS rounds (
+            number INTEGER PRIMARY KEY,
+            start_time DATETIME,
+            end_time DATETIME,
+            seed_composition_id INTEGER,
+            FOREIGN KEY(seed_composition_id) REFERENCES compositions(id)
+        )
+    ''')
+
+    conn.commit()
+
+# User Creation Endpoint
 @app.post("/users/create")
-def create_user(username: str):
-    # Check if user already exists
-    if any(user.username == username for user in app_state.users):
+def create_user(user: UserCreate, db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    try:
+        cursor.execute("INSERT INTO users (username) VALUES (?)", (user.username,))
+        db.commit()
+        return {"username": user.username, "user_id": cursor.lastrowid}
+    except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="Username already exists")
-    
-    new_user = User(username)
-    app_state.users.append(new_user)
-    return {"username": new_user.username, "user_id": new_user.id}
 
+# Start New Round Endpoint
 @app.post("/rounds/start")
-def start_new_round():
-    # Create a new round
-    new_round_number = len(app_state.rounds) + 1
-    new_round = Round(new_round_number)
+def start_new_round(db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
     
-    # If there's a previous round, potentially do something with it
-    if app_state.current_round:
-        # Logic for selecting seed composition would go here
-        pass
+    # Determine the next round number
+    cursor.execute("SELECT COALESCE(MAX(number), 0) + 1 FROM rounds")
+    next_round_number = cursor.fetchone()[0]
     
-    app_state.rounds.append(new_round)
-    app_state.current_round = new_round
+    # Get current timestamp
+    now = datetime.now()
+    end_time = now + timedelta(hours=24)
     
-    return {
-        "round_number": new_round.number, 
-        "start_time": new_round.start_time, 
-        "end_time": new_round.end_time
-    }
-
-@app.post("/compositions/upload")
-def upload_composition(username: str, content: str):
-    # Find user
-    user = next((u for u in app_state.users if u.username == username), None)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Ensure we have an active round
-    if not app_state.current_round:
-        raise HTTPException(status_code=400, detail="No active round")
-    
-    # Create composition
-    composition = Composition(
-        user=user, 
-        content=content, 
-        round_number=app_state.current_round.number
+    # Insert new round
+    cursor.execute(
+        "INSERT INTO rounds (number, start_time, end_time) VALUES (?, ?, ?)", 
+        (next_round_number, now, end_time)
     )
-    
-    # Add to current round
-    app_state.current_round.compositions.append(composition)
+    db.commit()
     
     return {
-        "composition_id": composition.id, 
-        "round_number": composition.round_number
+        "round_number": next_round_number, 
+        "start_time": now.isoformat(), 
+        "end_time": end_time.isoformat()
     }
 
-@app.post("/compositions/vote")
-def vote_composition(composition_id: int):
-    # Find composition in current round
-    if not app_state.current_round:
-        raise HTTPException(status_code=400, detail="No active round")
+# Composition Upload Endpoint
+@app.post("/compositions/upload")
+def upload_composition(
+    composition: CompositionCreate, 
+    db: sqlite3.Connection = Depends(get_db)
+):
+    cursor = db.cursor()
     
-    composition = next((c for c in app_state.current_round.compositions if c.id == composition_id), None)
-    if not composition:
+    # Find user
+    cursor.execute("SELECT id FROM users WHERE username = ?", (composition.username,))
+    user_result = cursor.fetchone()
+    if not user_result:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_id = user_result[0]
+    
+    # Find current round
+    cursor.execute("SELECT number FROM rounds ORDER BY number DESC LIMIT 1")
+    current_round = cursor.fetchone()
+    if not current_round:
+        raise HTTPException(status_code=400, detail="No active round")
+    round_number = current_round[0]
+    
+    # Insert composition
+    cursor.execute(
+        "INSERT INTO compositions (user_id, content, round_number, timestamp, votes) VALUES (?, ?, ?, ?, 0)", 
+        (user_id, composition.content, round_number, datetime.now())
+    )
+    db.commit()
+    
+    return {
+        "composition_id": cursor.lastrowid, 
+        "round_number": round_number
+    }
+
+# Voting Endpoint
+@app.post("/compositions/vote")
+def vote_composition(composition_id: int, db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    
+    # Check if composition exists
+    cursor.execute("SELECT * FROM compositions WHERE id = ?", (composition_id,))
+    if not cursor.fetchone():
         raise HTTPException(status_code=404, detail="Composition not found")
     
-    composition.votes += 1
+    # Vote
+    cursor.execute("UPDATE compositions SET votes = votes + 1 WHERE id = ?", (composition_id,))
+    db.commit()
     
-    return {"composition_id": composition.id, "votes": composition.votes}
+    # Fetch updated vote count
+    cursor.execute("SELECT votes FROM compositions WHERE id = ?", (composition_id,))
+    votes = cursor.fetchone()[0]
+    
+    return {"composition_id": composition_id, "votes": votes}
 
-# Optional: Add a simple endpoint to get current round info
-@app.get("/rounds/current")
-def get_current_round():
-    if not app_state.current_round:
-        raise HTTPException(status_code=404, detail="No active round")
+# Get Current Round Compositions
+@app.get("/rounds/current", response_model=List[CompositionResponse])
+def get_current_round(db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
     
-    return {
-        "round_number": app_state.current_round.number,
-        "start_time": app_state.current_round.start_time,
-        "end_time": app_state.current_round.end_time,
-        "compositions": [
-            {
-                "id": c.id, 
-                "username": c.user.username, 
-                "votes": c.votes
-            } for c in app_state.current_round.compositions
-        ]
-    }
+    # Find current round
+    cursor.execute("SELECT number FROM rounds ORDER BY number DESC LIMIT 1")
+    current_round = cursor.fetchone()
+    if not current_round:
+        raise HTTPException(status_code=404, detail="No active round")
+    round_number = current_round[0]
+    
+    # Fetch compositions for current round
+    cursor.execute("""
+        SELECT c.id, u.username, c.content, c.votes 
+        FROM compositions c
+        JOIN users u ON c.user_id = u.id
+        WHERE c.round_number = ?
+    """, (round_number,))
+    
+    compositions = [
+        CompositionResponse(
+            id=row[0], 
+            username=row[1], 
+            content=row[2], 
+            votes=row[3]
+        ) for row in cursor.fetchall()
+    ]
+    
+    return compositions
+
+# Initialize database on startup
+@app.on_event("startup")
+def startup():
+    conn = sqlite3.connect('music_collab.db')
+    init_db(conn)
+    conn.close()
 
 if __name__ == "__main__":
     import uvicorn
